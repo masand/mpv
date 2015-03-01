@@ -79,6 +79,10 @@ struct vo_cocoa_state {
     uint64_t last_lmuvalue;
     int last_lux;
 
+    io_object_t l_notif;
+    CFRunLoopSourceRef l_rl_src;
+    IONotificationPortRef l_notif_port;
+
     pthread_mutex_t mutex;
     struct mp_log *log;
 
@@ -151,25 +155,6 @@ static void set_application_icon(NSApplication *app)
     [pool release];
 }
 
-static void cocoa_init_light_sensor(struct vo *vo)
-{
-    with_cocoa_lock_on_main_thread(vo, ^{
-        struct vo_cocoa_state *s = vo->cocoa;
-        io_service_t srv = IOServiceGetMatchingService(
-                kIOMasterPortDefault, IOServiceMatching("AppleLMUController"));
-        if (srv == IO_OBJECT_NULL) {
-            MP_VERBOSE(vo, "can't find an ambient light sensor\n");
-            return;
-        }
-        kern_return_t kr = IOServiceOpen(srv, mach_task_self(), 0, &s->light_sensor);
-        IOObjectRelease(srv);
-        if (kr != KERN_SUCCESS) {
-            MP_WARN(vo, "can't start ambient light sensor connection\n");
-            return;
-        }
-    });
-}
-
 static int lmuvalue_to_lux(uint64_t v)
 {
     // the polinomial approximation for apple lmu value -> lux was empirically
@@ -189,8 +174,9 @@ static int lmuvalue_to_lux(uint64_t v)
     return lux > 0 ? lux : 0;
 }
 
-static void cocoa_read_light_sensor_data(struct vo *vo)
+static void light_sensor_cb(void *ctx, io_service_t srv, natural_t mtype, void *msg)
 {
+    struct vo *vo = ctx;
     struct vo_cocoa_state *s = vo->cocoa;
     uint32_t outputs = 2;
     uint64_t values[outputs];
@@ -204,9 +190,47 @@ static void cocoa_read_light_sensor_data(struct vo *vo)
             s->last_lmuvalue = mean;
             s->last_lux = lmuvalue_to_lux(s->last_lmuvalue);
             s->pending_events |= VO_EVENT_AMBIENT_LIGHTING_CHANGED;
+            vo_wakeup(vo);
             return;
         }
     }
+}
+
+static void cocoa_init_light_sensor(struct vo *vo)
+{
+    with_cocoa_lock_on_main_thread(vo, ^{
+        struct vo_cocoa_state *s = vo->cocoa;
+        io_service_t srv = IOServiceGetMatchingService(
+                kIOMasterPortDefault, IOServiceMatching("AppleLMUController"));
+        if (srv == IO_OBJECT_NULL) {
+            MP_VERBOSE(vo, "can't find an ambient light sensor\n");
+            return;
+        }
+
+        // subscribe to notifications from the light sensor driver
+        s->l_notif_port = IONotificationPortCreate(kIOMasterPortDefault);
+        s->l_rl_src = IONotificationPortGetRunLoopSource(s->l_notif_port);
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), s->l_rl_src, kCFRunLoopDefaultMode);
+        IOServiceAddInterestNotification(s->l_notif_port, srv, kIOGeneralInterest,
+                                         light_sensor_cb, vo, &s->l_notif);
+
+        kern_return_t kr = IOServiceOpen(srv, mach_task_self(), 0, &s->light_sensor);
+        IOObjectRelease(srv);
+        if (kr != KERN_SUCCESS) {
+            MP_WARN(vo, "can't start ambient light sensor connection\n");
+            return;
+        }
+
+        light_sensor_cb(vo, 0, 0, NULL);
+    });
+}
+
+static void cocoa_uninit_light_sensor(struct vo *vo)
+{
+    struct vo_cocoa_state *s = vo->cocoa;
+    CFRunLoopRemoveSource(CFRunLoopGetCurrent(), s->l_rl_src, kCFRunLoopDefaultMode);
+    IONotificationPortDestroy(s->l_notif_port);
+    IOObjectRelease(s->light_sensor);
 }
 
 int vo_cocoa_init(struct vo *vo)
@@ -263,7 +287,7 @@ void vo_cocoa_uninit(struct vo *vo)
 
     with_cocoa_lock_on_main_thread(vo, ^{
         enable_power_management(vo);
-        IOObjectRelease(s->light_sensor);
+        cocoa_uninit_light_sensor(vo);
         cocoa_rm_fs_screen_profile_observer(vo);
 
         [s->gl_ctx release];
@@ -638,8 +662,6 @@ int vo_cocoa_check_events(struct vo *vo)
     struct vo_cocoa_state *s = vo->cocoa;
     int events = s->pending_events;
     s->pending_events = 0;
-
-    cocoa_read_light_sensor_data(vo);
 
     if (events & VO_EVENT_RESIZE) {
         resize_window(vo);
