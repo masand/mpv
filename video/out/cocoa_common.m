@@ -78,10 +78,7 @@ struct vo_cocoa_state {
     io_connect_t light_sensor;
     uint64_t last_lmuvalue;
     int last_lux;
-
-    io_object_t l_notif;
-    CFRunLoopSourceRef l_rl_src;
-    IONotificationPortRef l_notif_port;
+    IONotificationPortRef light_sensor_io_port;
 
     pthread_mutex_t mutex;
     struct mp_log *log;
@@ -208,13 +205,17 @@ static void cocoa_init_light_sensor(struct vo *vo)
         }
 
         // subscribe to notifications from the light sensor driver
-        s->l_notif_port = IONotificationPortCreate(kIOMasterPortDefault);
-        s->l_rl_src = IONotificationPortGetRunLoopSource(s->l_notif_port);
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), s->l_rl_src, kCFRunLoopDefaultMode);
-        IOServiceAddInterestNotification(s->l_notif_port, srv, kIOGeneralInterest,
-                                         light_sensor_cb, vo, &s->l_notif);
+        s->light_sensor_io_port = IONotificationPortCreate(kIOMasterPortDefault);
+        IONotificationPortSetDispatchQueue(
+            s->light_sensor_io_port, dispatch_get_main_queue());
 
-        kern_return_t kr = IOServiceOpen(srv, mach_task_self(), 0, &s->light_sensor);
+        io_object_t n;
+        IOServiceAddInterestNotification(
+            s->light_sensor_io_port, srv, kIOGeneralInterest, light_sensor_cb,
+            vo, &n);
+
+        kern_return_t kr = IOServiceOpen(srv, mach_task_self(), 0,
+                                         &s->light_sensor);
         IOObjectRelease(srv);
         if (kr != KERN_SUCCESS) {
             MP_WARN(vo, "can't start ambient light sensor connection\n");
@@ -228,8 +229,7 @@ static void cocoa_init_light_sensor(struct vo *vo)
 static void cocoa_uninit_light_sensor(struct vo *vo)
 {
     struct vo_cocoa_state *s = vo->cocoa;
-    CFRunLoopRemoveSource(CFRunLoopGetCurrent(), s->l_rl_src, kCFRunLoopDefaultMode);
-    IONotificationPortDestroy(s->l_notif_port);
+    IONotificationPortDestroy(s->light_sensor_io_port);
     IOObjectRelease(s->light_sensor);
 }
 
