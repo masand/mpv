@@ -334,9 +334,9 @@ bool fbotex_change(struct fbotex *fbo, GL *gl, struct mp_log *log, int w, int h,
 
     int cw = w, ch = h;
 
-    if ((flags & FBOTEX_FUZZY_W) && cw >= fbo->tex_w)
+    if ((flags & FBOTEX_FUZZY_W) && cw < fbo->tex_w)
         cw = fbo->tex_w;
-    if ((flags & FBOTEX_FUZZY_H) && ch >= fbo->tex_h)
+    if ((flags & FBOTEX_FUZZY_H) && ch < fbo->tex_h)
         ch = fbo->tex_h;
 
     if (fbo->tex_w == cw && fbo->tex_h == ch && fbo->iformat == iformat)

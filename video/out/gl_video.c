@@ -1118,7 +1118,7 @@ static void pass_convert_yuv(struct gl_video *p)
         gl_sc_uniform_mat3(sc, "colormatrix", true, &m.m[0][0]);
         gl_sc_uniform_vec3(sc, "colormatrix_c", m.c);
 
-        GLSL(color = vec4(mat3(colormatrix) * color.rgb + colormatrix_c, color.a);)
+        GLSL(color.rgb = mat3(colormatrix) * color.rgb + colormatrix_c;)
     }
 }
 
