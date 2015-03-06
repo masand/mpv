@@ -164,8 +164,6 @@ struct gl_video {
     bool use_lut_3d;
 
     GLuint dither_texture;
-    float dither_quantization;
-    float dither_center;
     int dither_size;
 
     struct mp_image_params real_image_params;   // configured format
@@ -1329,12 +1327,6 @@ static void pass_dither(struct gl_video *p)
             tex_data = temp;
         }
 
-        // This defines how many bits are considered significant for output on
-        // screen. The superfluous bits will be used for rounding according to the
-        // dither matrix. The precision of the source implicitly decides how many
-        // dither patterns can be visible.
-        p->dither_quantization = (1 << dst_depth) - 1;
-        p->dither_center = 0.5 / (tex_size * tex_size);
         p->dither_size = tex_size;
 
         gl->ActiveTexture(GL_TEXTURE0 + TEXUNIT_DITHER);
@@ -1355,9 +1347,16 @@ static void pass_dither(struct gl_video *p)
 
     GLSLF("// dithering\n");
 
+    // This defines how many bits are considered significant for output on
+    // screen. The superfluous bits will be used for rounding according to the
+    // dither matrix. The precision of the source implicitly decides how many
+    // dither patterns can be visible.
+    float dither_quantization = (1 << dst_depth) - 1;
+    float dither_center = 0.5 / (p->dither_size * p->dither_size);
+
     gl_sc_uniform_f(p->sc, "dither_size", p->dither_size);
-    gl_sc_uniform_f(p->sc, "dither_quantization", p->dither_quantization);
-    gl_sc_uniform_f(p->sc, "dither_center", p->dither_center);
+    gl_sc_uniform_f(p->sc, "dither_quantization", dither_quantization);
+    gl_sc_uniform_f(p->sc, "dither_center", dither_center);
     gl_sc_uniform_sampler(p->sc, "dither", GL_TEXTURE_2D, TEXUNIT_DITHER);
 
     GLSL(vec2 dither_pos = gl_FragCoord.xy / dither_size;)
