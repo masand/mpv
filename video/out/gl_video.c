@@ -179,9 +179,7 @@ struct gl_video {
     char color_swizzle[5];
     float chroma_fix[2];
 
-    float input_gamma, conv_gamma;
-    float user_gamma;
-    bool user_gamma_enabled; // shader handles user_gamma
+    bool user_gamma_enabled;
     bool sigmoid_enabled;
 
     struct video_image image;
@@ -1085,25 +1083,34 @@ static void pass_convert_yuv(struct gl_video *p)
 {
     struct gl_shader_cache *sc = p->sc;
 
+    struct mp_csp_params cparams = MP_CSP_PARAMS_DEFAULTS;
+    cparams.gray = p->is_yuv && !p->is_packed_yuv && p->plane_count == 1;
+    cparams.input_bits = p->image_desc.component_bits;
+    cparams.texture_bits = (cparams.input_bits + 7) & ~7;
+    mp_csp_set_image_params(&cparams, &p->image_params);
+    mp_csp_copy_equalizer_values(&cparams, &p->video_eq);
+
+    float user_gamma = cparams.gamma * p->opts.gamma;
+    p->user_gamma_enabled |= user_gamma != 1.0;
+
     GLSLF("// color conversion\n");
 
     if (p->color_swizzle[0])
         GLSLF("color = color.%s;\n", p->color_swizzle);
 
-    // Conversion from Y'CbCr or other spaces to RGB
-    if (!p->is_rgb) {
-        struct mp_csp_params cparams = MP_CSP_PARAMS_DEFAULTS;
-        cparams.gray = p->is_yuv && !p->is_packed_yuv && p->plane_count == 1;
-        cparams.input_bits = p->image_desc.component_bits;
-        cparams.texture_bits = (cparams.input_bits + 7) & ~7;
-        mp_csp_set_image_params(&cparams, &p->image_params);
-        mp_csp_copy_equalizer_values(&cparams, &p->video_eq);
-        if (p->image_desc.flags & MP_IMGFLAG_XYZ) {
-            cparams.colorspace = MP_CSP_XYZ;
-            cparams.input_bits = 8;
-            cparams.texture_bits = 8;
-        }
+    // Pre-colormatrix input gamma correction
+    if (p->image_desc.flags & MP_IMGFLAG_XYZ) {
+        cparams.colorspace = MP_CSP_XYZ;
+        cparams.input_bits = 8;
+        cparams.texture_bits = 8;
 
+        // Pre-colormatrix input gamma correction. Note that this results in
+        // linear light
+        GLSL(color.rgb *= vec3(2.6);)
+    }
+
+    // Conversion from Y'CbCr or other linear spaces to RGB
+    if (!p->is_rgb) {
         struct mp_cmat m = {{{0}}};
         if (p->image_desc.flags & MP_IMGFLAG_XYZ) {
             // Hard-coded as relative colorimetric for now, since this transforms
@@ -1119,6 +1126,45 @@ static void pass_convert_yuv(struct gl_video *p)
         gl_sc_uniform_vec3(sc, "colormatrix_c", m.c);
 
         GLSL(color.rgb = mat3(colormatrix) * color.rgb + colormatrix_c;)
+    }
+
+    if (p->image_params.colorspace == MP_CSP_BT_2020_C) {
+        // Conversion for C'rcY'cC'bc via the BT.2020 CL system:
+        // C'bc = (B'-Y'c) / 1.9404  | C'bc <= 0
+        //      = (B'-Y'c) / 1.5816  | C'bc >  0
+        //
+        // C'rc = (R'-Y'c) / 1.7184  | C'rc <= 0
+        //      = (R'-Y'c) / 0.9936  | C'rc >  0
+        //
+        // as per the BT.2020 specification, table 4. This is a non-linear
+        // transformation because (constant) luminance receives non-equal
+        // contributions from the three different channels.
+        GLSLF("// constant luminance conversion\n");
+        GLSL(color.br = color.br * mix(vec2(1.5816, 0.9936),
+                                       vec2(1.9404, 1.7184),
+                                       lessThanEqual(color.br, vec2(0)))
+                        + color.gg;)
+        // Expand channels to camera-linear light. This shader currently just
+        // assumes everything uses the BT.2020 12-bit gamma function, since the
+        // difference between 10 and 12-bit is negligible for anything other
+        // than 12-bit content.
+        GLSL(color.rgb = mix(color.rgb / vec3(4.5),
+                             pow((color.rgb + vec3(0.0993))/vec3(1.0993), vec3(1.0/0.45)),
+                             lessThanEqual(vec3(0.08145), color.rgb));)
+        // Calculate the green channel from the expanded RYcB
+        // The BT.2020 specification says Yc = 0.2627*R + 0.6780*G + 0.0593*B
+        GLSL(color.g = (color.g - 0.2627*color.r - 0.0593*color.b)/0.6780;)
+        // Re-compand to receive the R'G'B' result, same as other systems
+        GLSL(color.rgb = mix(color.rgb * vec3(4.5),
+                             vec3(1.0993) * pow(color.rgb, vec3(0.45)) - vec3(0.0993),
+                             lessThanEqual(vec3(0.0181), color.rgb));)
+    }
+
+    GLSL(color.rgb = clamp(color.rgb, 0.0, 1.0);)
+
+    if (p->user_gamma_enabled) {
+        gl_sc_uniform_f(sc, "user_gamma", user_gamma);
+        GLSL(color.rgb = pow(color.rgb, vec3(1.0 / user_gamma));)
     }
 }
 
@@ -1152,6 +1198,46 @@ static void pass_scale_main(struct gl_video *p, bool use_indirect)
         scale_factor = FFMAX(1.0, 1.0 / f);
     }
 
+    bool use_srgb = p->opts.srgb;
+    bool use_cms  = use_srgb || p->use_lut_3d;
+
+    // Pre-conversion, like linear light/sigmoidization
+    GLSLF("// scaler pre-conversion\n");
+    bool use_linear = p->opts.linear_scaling || p->opts.sigmoid_upscaling
+                      || use_cms || p->image_desc.flags & MP_IMGFLAG_XYZ;
+    if (use_linear) {
+        switch (p->image_params.gamma) {
+            case MP_CSP_TRC_SRGB:
+                GLSL(color.rgb = mix(color.rgb / vec3(12.92),
+                                     pow((color.rgb + vec3(0.055))/vec3(1.055), vec3(2.4)),
+                                     lessThanEqual(vec3(0.04045), color.rgb));)
+                break;
+            case MP_CSP_TRC_BT_1886:
+                GLSL(color.rgb = pow(color.rgb, vec3(1.961));)
+                break;
+        }
+    }
+
+    bool use_sigmoid = use_linear && p->opts.sigmoid_upscaling && upscaling;
+    float sig_center, sig_slope, sig_offset, sig_scale;
+    if (use_sigmoid) {
+        // Coefficients for the sigmoidal transform are taken from the
+        // formula here: http://www.imagemagick.org/Usage/color_mods/#sigmoidal
+        sig_center = p->opts.sigmoid_center;
+        sig_slope  = p->opts.sigmoid_slope;
+        // This function needs to go through (0,0) and (1,1) so we compute the
+        // values at 1 and 0, and then scale/shift them, respectively.
+        sig_offset = 1.0/(1+expf(sig_slope * sig_center));
+        sig_scale  = 1.0/(1+expf(sig_slope * (sig_center-1))) - sig_offset;
+
+        gl_sc_uniform_f(p->sc, "sig_center", sig_center);
+        gl_sc_uniform_f(p->sc, "sig_slope" , sig_slope);
+        gl_sc_uniform_f(p->sc, "sig_offset", sig_offset);
+        gl_sc_uniform_f(p->sc, "sig_scale" , sig_scale);
+        GLSL(color.rgb = sig_center -
+                 log(1.0/(color.rgb * sig_scale + sig_offset) - 1.0)/sig_slope;)
+    }
+
     GLSLF("// main scaling\n");
     if (!use_indirect && strcmp(scaler, "bilinear") == 0) {
         // implicitly scale in pass_video_to_screen
@@ -1162,6 +1248,37 @@ static void pass_scale_main(struct gl_video *p, bool use_indirect)
         int h = p->dst_rect.y1 - p->dst_rect.y0;
         pass_scale(p, 0, scaler, scale_factor, w, h);
     }
+
+    GLSLF("// scaler post-conversion\n");
+    if (use_sigmoid) {
+        // Inverse of the transformation above
+        gl_sc_uniform_f(p->sc, "sig_center", sig_center);
+        gl_sc_uniform_f(p->sc, "sig_slope" , sig_slope);
+        gl_sc_uniform_f(p->sc, "sig_offset", sig_offset);
+        gl_sc_uniform_f(p->sc, "sig_scale" , sig_scale);
+        GLSL(color.rgb = (1.0/(1.0 + exp(sig_slope * (sig_center - color.rgb)))
+                             - sig_offset) / sig_scale;)
+    }
+
+    if (use_linear && !use_cms) {
+        // Inverse of the linear light transformation. Not needed if CMS is
+        // turned on, since it happens automatically in those cases.
+        switch (p->image_params.gamma) {
+            case MP_CSP_TRC_SRGB:
+                use_srgb = true;
+                break;
+            case MP_CSP_TRC_BT_1886:
+                GLSL(color.rgb = pow(color.rgb, vec3(1.0/1.961));)
+                break;
+            case MP_CSP_TRC_LINEAR:
+                // Pick something arbitrary most likely bound to look good
+                GLSL(color.rgb = pow(color.rgb, vec3(1.0/2.2));)
+                break;
+        }
+    }
+
+    GLSLF("// color management\n");
+    // TODO: cms
 }
 
 static void pass_dither(struct gl_video *p)
@@ -1237,6 +1354,8 @@ static void pass_dither(struct gl_video *p)
 
         debug_check_gl(p, "dither setup");
     }
+
+    GLSLF("// dithering\n");
 
     gl_sc_uniform_f(p->sc, "dither_size", p->dither_size);
     gl_sc_uniform_f(p->sc, "dither_quantization", p->dither_quantization);
@@ -1785,7 +1904,6 @@ struct gl_video *gl_video_init(GL *gl, struct mp_log *log, struct osd_state *osd
         .opts = gl_video_opts_def,
         .gl_target = GL_TEXTURE_2D,
         .texture_16bit_depth = 16,
-        .user_gamma = 1.0f,
         .scalers = {
             { .index = 0, .name = "bilinear" },
             { .index = 1, .name = "bilinear" },
