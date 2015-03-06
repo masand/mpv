@@ -1229,13 +1229,8 @@ static void pass_scale_main(struct gl_video *p, bool use_indirect)
         // values at 1 and 0, and then scale/shift them, respectively.
         sig_offset = 1.0/(1+expf(sig_slope * sig_center));
         sig_scale  = 1.0/(1+expf(sig_slope * (sig_center-1))) - sig_offset;
-
-        gl_sc_uniform_f(p->sc, "sig_center", sig_center);
-        gl_sc_uniform_f(p->sc, "sig_slope" , sig_slope);
-        gl_sc_uniform_f(p->sc, "sig_offset", sig_offset);
-        gl_sc_uniform_f(p->sc, "sig_scale" , sig_scale);
-        GLSL(color.rgb = sig_center -
-                 log(1.0/(color.rgb * sig_scale + sig_offset) - 1.0)/sig_slope;)
+        GLSLF("color.rgb = %f - log(1.0/(color.rgb * %f + %f) - 1.0)/%f;\n",
+                sig_center, sig_scale, sig_offset, sig_slope);
     }
 
     GLSLF("// main scaling\n");
@@ -1252,12 +1247,8 @@ static void pass_scale_main(struct gl_video *p, bool use_indirect)
     GLSLF("// scaler post-conversion\n");
     if (use_sigmoid) {
         // Inverse of the transformation above
-        gl_sc_uniform_f(p->sc, "sig_center", sig_center);
-        gl_sc_uniform_f(p->sc, "sig_slope" , sig_slope);
-        gl_sc_uniform_f(p->sc, "sig_offset", sig_offset);
-        gl_sc_uniform_f(p->sc, "sig_scale" , sig_scale);
-        GLSL(color.rgb = (1.0/(1.0 + exp(sig_slope * (sig_center - color.rgb)))
-                             - sig_offset) / sig_scale;)
+        GLSLF("color.rgb = (1.0/(1.0 + exp(%f * (%f - color.rgb))) - %f) / %f;\n",
+                sig_slope, sig_center, sig_offset, sig_scale);
     }
 
     if (use_linear && !use_cms) {
@@ -1279,6 +1270,13 @@ static void pass_scale_main(struct gl_video *p, bool use_indirect)
 
     GLSLF("// color management\n");
     // TODO: cms
+
+    // temp hack to test stuff
+    if (use_srgb) {
+        GLSL(color.rgb = mix(color.rgb * vec3(12.92),
+                             vec3(1.055) * pow(color.rgb, vec3(1.0/2.4)) - vec3(0.055),
+                             lessThanEqual(vec3(0.0031308), color.rgb));)
+    }
 }
 
 static void pass_dither(struct gl_video *p)
