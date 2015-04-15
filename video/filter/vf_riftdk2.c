@@ -42,30 +42,84 @@ static void fill_half_of_lookup_table(int width, int height,
         stopx = width;
     }
     
-    for (int x = startx; x < stopx; x++) {
-        for (int y = starty; y < stopy; y++) {
+    for (int y = starty; y < stopy; y++) {
+        for (int x = startx; x < stopx; x++) {
+            /*
+             *  NEXT STEP: Try with inverse function!
+                y = 0.24x⁴ + 0.22x² + 1 for x > 0 (Radius!)
+                x = 0.24y⁴ + 0.22y² + 1
+                 substitute: t = y²
+                x = 0.24t² + 0.22t + 1 = 0.24(t² + 0.22/0.24t + 1/0.24)
+                  = 0.24(t² + 0.22/0.24t + (0.22/0.48)² - (0.22/0.48)² + 1/0.24)
+                  = 0.24((t + 0.22/0.48)² - 0.22²/0.48² + 1/0.24)
+                  = 0.24((t + 0.11/0.24)² - 0.0484/0.48² + 2*0.48/0.48²)
+                  = 0.24((t + 0.11/0.24)² + 0.9116/0.48²)
+                <=>
+                x/0.24 - 0.9116/0.48² = (t + 0.11/0.24)²
+                t = -0.11/0.24 +/- sqrt(x/0.24 - 0.9116/0.48²)
+                =>
+                y = +/- sqrt( -0.11/0.24 +/- sqrt(x/0.24 - 0.9116/0.48²))
+
+                => in our case (only positive values possible):
+                y = sqrt(-0.11/0.24 + sqrt(x/0.24 - 0.9116/0.48²))
+                * 
+                * Mathematica: -0.204124 Sqrt[-11. - 1. Sqrt[-2279. + 2400. #1]] &
+             */
+             /* Inverse 2: 
+                y = 0.24x⁵ + 0.22x³ + x for x > 0 (Radius!)
+                x = 0.24y⁵ + 0.22y³ + y
+                 substitute: t = y²; y = sqrt(t)
+                x = sqrt(t)*(0.24t² + 0.22t + 1) = sqrt(t)*(0.24(t² + 0.22/0.24t + 1/0.24))
+                x/sqrt(t) = 0.24(t² + 0.22/0.24t + (0.22/0.48)² - (0.22/0.48)² + 1/0.24)
+                          = 0.24((t + 0.22/0.48)² - 0.22²/0.48² + 1/0.24)
+                          = 0.24((t + 0.11/0.24)² - 0.0484/0.48² + 2*0.48/0.48²)
+                          = 0.24((t + 0.11/0.24)² + 0.9116/0.48²)
+                <=>
+                x/sqrt(t)/0.24 - 0.9116/0.48² = (t + 0.11/0.24)²
+                t = -0.11/0.24 +/- (sqrt(x/0.24 - 0.9116/0.48²) / sqrt(y))
+                =>
+                y = +/- sqrt( -0.11/0.24 +/- sqrt(x/0.24 - 0.9116/0.48²))
+
+                => in our case (only positive values possible):
+                y = sqrt(-0.11/0.24 + sqrt(x/0.24 - 0.9116/0.48²))
+                * 
+                * Mathematica: -0.204124 Sqrt[-11. - 1. Sqrt[-2279. + 2400. #1]] &
+
+              */
             // inspired by: http://jsfiddle.net/s175ozts/4/
-            int myX = xmid-x;
-            int myY = ymid-y;
+            int myX = x-xmid;
+            int myY = y-ymid;
             // according to the author on the website above, we need to
             // normalize the radius for proper calculation in the atan,
-            // sin and cos functions
-            float maxR = sqrt(pow((stopx - startx) / 2.0, 2) +
-                              pow(ymid / 2.0, 2));
-            float myR = sqrt(pow(myX, 2) + pow(myY, 2));
-            float myRN = myR / maxR;
+            // sin and cos functions. Also the distortion function needs
+            // to work in [0,1]
+            double maxR = sqrt(pow((stopx - startx) / 2.0, 2) +
+                              pow(ymid, 2));
+            // range of myR: [0, maxR]
+            double myR = sqrt(pow(myX, 2) + pow(myY, 2));
+            // range of myRN: [0,1]
+            double myRN = myR / maxR;
             // use the distortion function
-            float newR = myR * (0.24 * pow(myRN, 4) + 
-                                0.22 * pow(myRN, 2) + 1);
+            // -> range of newR: [0, 1.46*maxR]
+            double newR = myR * (0.24 * pow(myRN, 4) + 
+                                 0.22 * pow(myRN, 2) + 1);
+            // TODO: Do stop here if newR > maxR (worked - nearly...)
+            /*if (newR > maxR) {
+                // use -1 to mark as invalid
+                (*lookup_table)[2 * y * width + 2 * x + 0] = -1;
+                (*lookup_table)[2 * y * width + 2 * x + 1] = -1;
+            }
+            else {*/
+            printf("%.10f -> %.10f\n", newR/maxR, myR/maxR);
             // then calculate back to x/y coordinates
-            float alpha = atan2(myY, myX);
-            float newXf = fabs(cos(alpha) * newR - xmid);
-            float newYf = fabs(sin(alpha) * newR - ymid);
+            double alpha = atan2(myY, myX);
+            double newXf = fabs(xmid + cos(alpha) * newR);
+            double newYf = fabs(ymid + sin(alpha) * newR);
             // calculate the new radius to doublecheck (otherwise there
             // were some parts of the picture projected to the outside
             // the wished "barrel")
-            float gnRadius = sqrt(pow(xmid - newXf, 2) + 
-                                  pow(ymid - newYf, 2));
+            double gnRadius = sqrt(pow(newXf - xmid, 2) + 
+                                  pow(newYf - ymid, 2));
             int newX = (int) (newXf + 0.5);
             int newY = (int) (newYf + 0.5);
             // the above function gives us a double-concarve projection,
@@ -81,11 +135,66 @@ static void fill_half_of_lookup_table(int width, int height,
                 (*lookup_table)[2 * y * width + 2 * x + 1] = newY;
             } else {
                 // use -1 to mark as invalid
-                (*lookup_table)[2 * y * width + 2 * x + 0] = -1;
-                (*lookup_table)[2 * y * width + 2 * x + 1] = -1;
+                //(*lookup_table)[2 * y * width + 2 * x + 0] = -1;
+                //(*lookup_table)[2 * y * width + 2 * x + 1] = -1;
             }
         }
-    }       
+        //}
+    }
+    ///// IDEA: Calculate x⁴ for x=0 to maxR, then build the inverse
+    // values and check whether 0 to maxR returns!
+    
+    /*//for (int x = startx; x < stopx; x++) {
+    for (int x = 0; x < 75; x++) {        
+        //for (int y = starty; y < stopy; y++) {
+        for (int y = 0; y < 75; y++) {
+            int xlookup = (*lookup_table)[2 * y * width + 2 * x + 0];
+            int ylookup = (*lookup_table)[2 * y * width + 2 * x + 1];
+            if (xlookup == -1 || ylookup == -1)
+                continue;
+            printf("xlookup = %d, ylookup = %d\n", xlookup, ylookup);
+            int myX = xlookup-xmid;
+            int myY = ylookup-ymid;
+            printf("myX = %d, myY = %d\n", myX, myY);
+            double maxR = 1.46*(sqrt(pow((stopx - startx) / 2.0, 2) +
+                               pow(ymid / 2.0, 2)));
+            double myR = sqrt(pow(myX, 2) + pow(myY, 2));
+            double myRN = myR / maxR;
+            printf("myR = %f, myRN = %f\n", myR, myRN);
+            // use the distortion function
+            //sqrt(-0.11/0.24 + sqrt(x/0.24 - 0.9116/0.48²))
+            double newR = myR * sqrt(-0.11/0.24 + 
+                                    sqrt(myRN/0.24 - 0.9116/pow(0.48,2)));
+            printf("newR = %f\n", newR);
+            // then calculate back to x/y coordinates
+            double alpha = atan2(myY, myX);
+            double newXf = fabs(xmid + cos(alpha) * newR);
+            double newYf = fabs(ymid + sin(alpha) * newR);
+            // calculate the new radius to doublecheck (otherwise there
+            // were some parts of the picture projected to the outside
+            // the wished "barrel")
+            double gnRadius = sqrt(pow(newXf - xmid, 2) + 
+                                  pow(newYf - ymid, 2));
+            int newX = (int) (newXf + 0.5);
+            int newY = (int) (newYf + 0.5);
+            if (newX != x) printf("newX = %d, x = %d\n", newX, x);
+            if (newY != y) printf("newY = %d, y = %d\n", newY, y);
+        }
+    }*/
+}
+
+static void tmp_print_lookup_table(int width, int height, int **lookup_table)
+{
+    printf("P2\n%d %d\n255\n", width, height);
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int xlookup = (*lookup_table)[2 * y * width + 2 * x + 0];
+            int ylookup = (*lookup_table)[2 * y * width + 2 * x + 1];
+            if (xlookup == -1 || ylookup == -1) printf("0 ");
+            else printf("255 ");
+        }
+        printf("\n");
+    }
 }
 
 static int init_lookup_table(int width, int height, int **lookup_table)
@@ -96,6 +205,7 @@ static int init_lookup_table(int width, int height, int **lookup_table)
         return 0;
     fill_half_of_lookup_table(width, height, lookup_table, 1);
     fill_half_of_lookup_table(width, height, lookup_table, 0);
+    //tmp_print_lookup_table(width, height, lookup_table);
     return 1;
 }
 
